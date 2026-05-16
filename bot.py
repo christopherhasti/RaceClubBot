@@ -6,16 +6,29 @@ import sys
 import discord
 from discord.ext import commands
 
-# Safely load internal server infrastructure IDs from the local uncommitted environment parameters
-WAITING_ROOM_VC_ID = int(os.getenv("WAITING_ROOM_VC_ID", 0))
-RACE_CATEGORY_ID = int(os.getenv("RACE_CATEGORY_ID", 0))
+# --- ENVIRONMENT CONFIGURATION ---
+# Safely parse the .env file BEFORE defining variables to prevent ID failures.
+# This automatically strips any accidental leading or trailing spaces from your keys and values.
+if os.path.exists(".env"):
+    with open(".env", "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                os.environ[key.strip()] = value.strip()
+
+def get_env_int(key, default=0):
+    val = os.environ.get(key)
+    return int(val) if val and val.isdigit() else default
+
+WAITING_ROOM_VC_ID = get_env_int("WAITING_ROOM_VC_ID")
+RACE_CATEGORY_ID = get_env_int("RACE_CATEGORY_ID")
 
 # Time (in seconds) to leave the voice room active after a race finishes.
 POST_RACE_GRACE_SECONDS = 45
 
 # Target production log path:
 LOG_DIRECTORY = os.path.join(os.path.expanduser("~"), "Documents", "LoungeControl", "Server", "logs")
-# Note: Set to "." if testing locally inside the active script folder
 
 # Complete hardware layout pre-populated with permanent identifiers
 hardware_map = {
@@ -32,26 +45,18 @@ hardware_map = {
     "cj4pvupxyq1": "RCB_11"   # Rig 11
 }
 
-# Roster staging tracker: {group_id: {"RCB_1": "Real Name", "RCB_2": "Real Name"}}
 pending_groups = {}
-
-# Ephemeral mapping buffer parsing recent multi-line [ACGroupVM] driver block states
-# Maps physical zero-indexed session slots to extracted string names: {0: "Adam LaBarbera"}
 recent_vm_names = {}
-
-# Active session channels: {group_id: {"channel_id": int}}
 active_groups = {}
-
-# Active delayed setup tasks: {group_id: Task}
 setup_tasks = {}
-
-# Active delayed cleanup tasks: {group_id: Task}
 cleanup_tasks = {}
 
+# Ensure required intent is explicitly enabled
 intents = discord.Intents.default()
 intents.members = True
 intents.guilds = True
 intents.voice_states = True
+intents.message_content = True  
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -83,7 +88,6 @@ def find_rig_member(guild, rig_name):
     """
     target = rig_name.lower()
     for member in guild.members:
-        # Check underlying immutable identity attributes alongside active overlays
         base_username = member.name.lower()
         global_name = (member.global_name or "").lower()
         server_nick = (member.nick or "").lower()
@@ -94,7 +98,7 @@ def find_rig_member(guild, rig_name):
     return None
 
 async def execute_delayed_setup(group_id):
-    """Waits 500ms to allow back-to-back Ready Check log writes to settle, then builds the grid."""
+    """Waits 500ms to allow session writes to settle, then builds the grid."""
     await asyncio.sleep(0.5)
     staged_data = pending_groups.pop(group_id, {})
     setup_tasks.pop(group_id, None)
@@ -136,11 +140,16 @@ async def monitor_log_files():
     file_handle.seek(0, os.SEEK_END)
 
     capturing_vm = False
+    is_valid_state = False
+    
+    # Sequence queue to track hardware before the group is officially created
+    recent_slot_assignments = []
 
     while True:
+        # Clear EOF lock for Windows to ensure continuous reading
+        file_handle.seek(file_handle.tell())
         line = file_handle.readline()
         
-        # Intra-day split sequence monitoring
         if not line:
             active_path = get_active_log_path()
             if active_path and active_path != current_path:
@@ -155,7 +164,7 @@ async def monitor_log_files():
 
         line_lower = line.lower()
 
-        # 1. LIVE HARDWARE DISCOVERY (Backup fallback for unmapped replacement hardware)
+        # 1. LIVE HARDWARE DISCOVERY
         conn_match = re.search(r"Launcher\s+(RCB[\w\s]+)\s+\(([a-z0-9]+)\)\s+connected", line, re.IGNORECASE)
         if conn_match:
             raw_name = conn_match.group(1).strip()
@@ -164,28 +173,47 @@ async def monitor_log_files():
             hardware_map[hw_code] = formatted_rig
             continue
 
-        # 2. NAME EXTRACTION FROM PRE-START [ACGroupVM] BLOCKS
-        # Captures multi-line outputs like: "0, Launcher, Adam LaBarbera, Audi R8 GT3 Evo 2"
+        # 2. PRE-CREATION ASSIGNMENT QUEUE
+        # Captures rigs instantly as the admin assigns them in LoungeControl
+        slot_match = re.search(r"launcher assinged to slot\s+([a-z0-9]+)", line, re.IGNORECASE)
+        if slot_match:
+            hw_code = slot_match.group(1).lower()
+            if hw_code not in recent_slot_assignments:
+                recent_slot_assignments.append(hw_code)
+            continue
+
+        # 3. NAME EXTRACTION FROM PRE-START [ACGroupVM] BLOCKS
         if "[ACGroupVM]" in line:
             capturing_vm = True
-            recent_vm_names = {}
+            is_valid_state = False
             continue
             
         if capturing_vm:
             if not line.strip() or re.match(r"^\d{4}-\d{2}-\d{2}", line.strip()):
                 capturing_vm = False
             elif "Group state:" in line:
+                if any(s in line for s in ["Creating", "ServerCreation", "Starting", "CarSelection", "Practice"]):
+                    is_valid_state = True
+                else:
+                    is_valid_state = False
                 continue
             else:
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 3 and parts[0].isdigit():
+                if len(parts) >= 3 and parts[0].isdigit() and is_valid_state:
                     slot_index = int(parts[0])
                     extracted_name = parts[2]
-                    recent_vm_names[slot_index] = extracted_name
+                    
+                    # Zip the extracted name dynamically to the queued hardware ID
+                    if slot_index < len(recent_slot_assignments):
+                        hw_code = recent_slot_assignments[slot_index]
+                        recent_vm_names[hw_code] = extracted_name
                 continue
 
-        # 3. EARLY ROSTER STAGING & RAPID SETUP TRIGGER
-        # Intercepts: "Send start Ready Check to slot 0, e5jgr10z2sx, group: LobbyA"
+        # -------------------------------------------------------------
+        # DUAL-TRIGGER ARCHITECTURE: Whichever logs first builds the room
+        # -------------------------------------------------------------
+        
+        # TRIGGER A: THE READY CHECK (Enabled Ready Screen)
         ready_match = re.search(r"Send start Ready Check to slot (\d+),\s*([a-z0-9]+),\s*group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
         if ready_match:
             slot_id = int(ready_match.group(1))
@@ -197,15 +225,41 @@ async def monitor_log_files():
                 if group_id not in pending_groups:
                     pending_groups[group_id] = {}
                     
-                driver_name = recent_vm_names.get(slot_id, rig_account)
+                driver_name = recent_vm_names.get(hw_code, rig_account)
                 pending_groups[group_id][rig_account] = driver_name
-                print(f"[Grid Staged] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
+                print(f"[Grid Staged - Method A] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
                 
                 if group_id not in setup_tasks and not any(k.lower() == group_id.lower() for k in active_groups):
                     setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
             continue
 
-        # 4. SESSION FINISHED COMMAND (Trigger Post-Race Grace Period Teardown)
+        # TRIGGER B: THE STATE TRANSITION (Disabled/Skipped Ready Screen)
+        start_match = re.search(r"changing group state from \w+ to (?:Starting|CarSelection|Practice), group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
+        if start_match:
+            group_id = start_match.group(1)
+            
+            # Scoop everyone we tracked via the VM extraction array
+            if recent_vm_names:
+                if group_id not in pending_groups:
+                    pending_groups[group_id] = {}
+                    
+                for hw_code, driver_name in recent_vm_names.items():
+                    rig_account = hardware_map.get(hw_code)
+                    if rig_account:
+                        pending_groups[group_id][rig_account] = driver_name
+                        print(f"[Grid Staged - Method B] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
+                
+                if group_id not in setup_tasks and not any(k.lower() == group_id.lower() for k in active_groups):
+                    setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
+                    
+                # Clear buffers after successful deployment to avoid ghost lobbies
+                recent_slot_assignments.clear()
+                recent_vm_names.clear()
+            continue
+        
+        # -------------------------------------------------------------
+
+        # 5. SESSION FINISHED COMMAND
         if "to finished" in line_lower:
             finish_match = re.search(r"group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
             if finish_match:
@@ -215,8 +269,7 @@ async def monitor_log_files():
                     await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
             continue
 
-        # 5. TRUE SESSION DELETION COMMAND (Overrides stopped bypass to delete lobby when dashboard clears)
-        # Note: Purposely bypasses "to stopped" lines to preserve troubleshooting comms for admin staff
+        # 6. TRUE SESSION DELETION COMMAND
         if "removed" in line_lower:
             teardown_match = re.search(r"group\s+([A-Za-z0-9_\-]+)\s+removed", line, re.IGNORECASE)
             if teardown_match:
@@ -235,11 +288,15 @@ async def monitor_log_files():
                     setup_tasks[extracted_id].cancel()
                     setup_tasks.pop(extracted_id, None)
                 pending_groups.pop(extracted_id, None)
+                recent_slot_assignments.clear()
 
 async def setup_race_vc(group_id, staged_roster):
     guild = bot.guilds[0]
     category = guild.get_channel(RACE_CATEGORY_ID)
     
+    if category is None:
+        print(f"CRITICAL WARNING: Category ID {RACE_CATEGORY_ID} not found. Ensure it is correct in your .env file. Creating channel out of bounds.")
+        
     vc_name = f"🏁 Server-{group_id}"
     race_vc = await guild.create_voice_channel(name=vc_name, category=category)
     active_groups[group_id] = {"channel_id": race_vc.id}
@@ -251,11 +308,14 @@ async def setup_race_vc(group_id, staged_roster):
                 await member.move_to(race_vc)
                 print(f" -> Successfully routed {rig_tag} to grid.")
                 
-                # Apply custom identity display overlay natively via Approach A
                 if target_name and target_name.lower() != rig_tag.lower():
+                    # Formats the nickname to display as "(RCB 1) Christopher Hastings"
+                    rig_display = rig_tag.replace("_", " ") 
+                    formatted_name = f"({rig_display}) {target_name}"[:32] # 32 is the max Discord limit
+                    
                     try:
-                        await member.edit(nick=target_name)
-                        print(f"    [Profile Engine] Applied display layer: {rig_tag} -> {target_name}")
+                        await member.edit(nick=formatted_name)
+                        print(f"    [Profile Engine] Applied display layer: {rig_tag} -> {formatted_name}")
                     except discord.Forbidden:
                         print(f"    [Security Warning] Gateway authorization blocked profile modification targeting: {rig_tag}")
                     except Exception as ex:
@@ -263,8 +323,6 @@ async def setup_race_vc(group_id, staged_roster):
                         
             except Exception as e:
                 print(f" -> Gateway restriction transporting {rig_tag}: {e}")
-        else:
-            pass
 
 async def cleanup_race_vc(group_id):
     group_data = active_groups.pop(group_id, None)
@@ -277,16 +335,11 @@ async def cleanup_race_vc(group_id):
     
     if race_vc:
         for member in list(race_vc.members):
-            # 1. Native Display Name Restoration via Approach A
-            # Passing nick=None safely unbinds custom string overlays directly on Discord servers,
-            # returning profiles cleanly to baseline account labels without local caching dictionaries.
             try:
-                await member.edit(nick=None)
-                print(f"    [Profile Engine] Restored baseline display mapping for ID: {member.id}")
+                await member.edit(nick=None) # Clears the custom tag and name, returning to baseline native RCB name
             except Exception:
                 pass
             
-            # 2. Base Return Routing
             if waiting_room_vc:
                 try:
                     await member.move_to(waiting_room_vc)
@@ -298,19 +351,17 @@ async def cleanup_race_vc(group_id):
 
 @bot.event
 async def on_ready():
-    print(f"Gateway interface ready. Operating profile: {bot.user.name}")
+    print(f"--- BOT ONLINE ---")
+    print(f"User: {bot.user.name}")
+    print(f"Target Category ID: {RACE_CATEGORY_ID}")
+    print(f"Target Waiting Room ID: {WAITING_ROOM_VC_ID}")
+    print(f"------------------")
     bot.loop.create_task(monitor_log_files())
 
 if __name__ == "__main__":
-    token = None
-    if os.path.exists(".env"):
-        with open(".env", "r") as f:
-            for line in f:
-                if line.startswith("DISCORD_TOKEN="):
-                    token = line.split("=", 1)[1].strip()
-    
+    token = os.getenv("DISCORD_TOKEN")
     if not token:
-        print("CRITICAL: Failed to evaluate target DISCORD_TOKEN configuration.")
+        print("CRITICAL: DISCORD_TOKEN not found in .env")
         sys.exit(1)
         
     bot.run(token)
