@@ -100,7 +100,7 @@ async def execute_delayed_setup(group_id):
     setup_tasks.pop(group_id, None)
     
     if staged_data and not any(k.lower() == group_id.lower() for k in active_groups):
-        print(f"\n[Grid Action] Roster locked! Establishing private voice infrastructure early for session: {group_id}")
+        print(f"\n[Grid Action] Roster locked! Establishing private voice infrastructure for session: {group_id}")
         await setup_race_vc(group_id, staged_data)
 
 async def schedule_cleanup(group_id, delay=0):
@@ -140,7 +140,6 @@ async def setup_race_vc(group_id, staged_roster):
                 if target_name and target_name.lower() != rig_tag.lower():
                     rig_display = rig_tag.replace("_", " ") 
                     
-                    # Intercept default LoungeControl dummy tests (e.g., "1 RCB")
                     if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
                         try:
                             await member.edit(nick=None)
@@ -198,7 +197,12 @@ async def monitor_log_files():
             file_handle = open(current_path, "r", encoding="utf-8", errors="replace")
             file_handle.seek(0, os.SEEK_END)
 
+            # Tracker variables for Backup System
             capturing_vm = False
+            current_vm_block = {}
+            last_vm_state = {}
+            active_car_applies = []
+            current_group_roster = {}
 
             while True:
                 file_handle.seek(file_handle.tell())
@@ -225,26 +229,57 @@ async def monitor_log_files():
                     hardware_map[hw_code] = formatted_rig
                     continue
 
-                # 2. NAME EXTRACTION FROM PRE-START [ACGroupVM] BLOCKS
+                # 2. CAR APPLIED INTERCEPTOR (Backup System)
+                car_apply_match = re.search(r"Launcher\s+([a-z0-9]+)\s+car applied\s+(.+)", line, re.IGNORECASE)
+                if car_apply_match:
+                    hw_code = car_apply_match.group(1).lower()
+                    car_name = car_apply_match.group(2).strip()
+                    active_car_applies.append((hw_code, car_name))
+                    continue
+
+                # 3. [ACGroupVM] STATE TRACKER
                 if "[ACGroupVM]" in line:
                     capturing_vm = True
                     recent_vm_names = {}
+                    current_vm_block = {}
                     continue
                     
                 if capturing_vm:
                     if not line.strip() or re.match(r"^\d{4}-\d{2}-\d{2}", line.strip()):
                         capturing_vm = False
+                        
+                        # Backup System: Process Car Assignments
+                        for slot_id, data in current_vm_block.items():
+                            driver_name = data["driver"]
+                            car_name = data["car"]
+                            old_car = last_vm_state.get(slot_id, {}).get("car", "")
+                            
+                            if car_name and car_name != old_car:
+                                for i, (hw, applied_car) in enumerate(active_car_applies):
+                                    if applied_car == car_name:
+                                        current_group_roster[hw] = driver_name
+                                        active_car_applies.pop(i)
+                                        break
+                        last_vm_state = current_vm_block.copy()
+                        
                     elif "Group state:" in line:
+                        if "Creating" in line:
+                            last_vm_state.clear()
+                            active_car_applies.clear()
+                            current_group_roster.clear()
                         continue
                     else:
                         parts = [p.strip() for p in line.split(",")]
                         if len(parts) >= 3 and parts[0].isdigit():
                             slot_index = int(parts[0])
                             extracted_name = parts[2]
+                            car_name = parts[3] if len(parts) >= 4 else ""
+                            
                             recent_vm_names[slot_index] = extracted_name
+                            current_vm_block[slot_index] = {"driver": extracted_name, "car": car_name}
                         continue
 
-                # 3. THE BULLETPROOF READY CHECK TRIGGER
+                # 4. PRIMARY SYSTEM: READY CHECK TRIGGER
                 ready_match = re.search(r"Send start Ready Check to slot (\d+),\s*([a-z0-9]+),\s*group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                 if ready_match:
                     slot_id = int(ready_match.group(1))
@@ -258,13 +293,32 @@ async def monitor_log_files():
                             
                         driver_name = recent_vm_names.get(slot_id, rig_account)
                         pending_groups[group_id][rig_account] = driver_name
-                        print(f"[Grid Staged] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
+                        print(f"[Grid Staged - PRIMARY] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
                         
                         if group_id not in setup_tasks and not any(k.lower() == group_id.lower() for k in active_groups):
                             setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
                     continue
 
-                # 4. SESSION FINISHED COMMAND
+                # 5. BACKUP SYSTEM: CAR SELECTION TRANSITION TRIGGER
+                # If Ready Check was skipped, this catches the lobby transitioning to the race phase.
+                start_match = re.search(r"changing group state from CarSelection to (?:ServerCreation|Practice), group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
+                if start_match:
+                    group_id = start_match.group(1)
+                    
+                    # Only execute backup if Primary System hasn't already handled this lobby
+                    if current_group_roster and not any(k.lower() == group_id.lower() for k in active_groups) and group_id not in setup_tasks:
+                        print(f"[Grid Staged - BACKUP] Ready Check bypassed. Using live car telemetry for session {group_id}.")
+                        pending_groups[group_id] = {}
+                        
+                        for hw_code, driver_name in current_group_roster.items():
+                            rig_account = hardware_map.get(hw_code)
+                            if rig_account:
+                                pending_groups[group_id][rig_account] = driver_name
+                                
+                        setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
+                    continue
+
+                # 6. SESSION FINISHED COMMAND
                 if "to finished" in line_lower:
                     finish_match = re.search(r"group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                     if finish_match:
@@ -274,7 +328,7 @@ async def monitor_log_files():
                             await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
                     continue
 
-                # 5. TRUE SESSION DELETION COMMAND
+                # 7. TRUE SESSION DELETION COMMAND
                 if "removed" in line_lower:
                     teardown_match = re.search(r"group\s+([A-Za-z0-9_\-]+)\s+removed", line, re.IGNORECASE)
                     if teardown_match:
@@ -300,11 +354,44 @@ async def monitor_log_files():
             await asyncio.sleep(5)
 
 @bot.event
+async def on_voice_state_update(member, before, after):
+    # If someone left a voice channel
+    if before.channel and before.channel != after.channel:
+        vc = before.channel
+        
+        # Safe Check: Is it empty AND did the bot create it?
+        if len(vc.members) == 0 and vc.name.startswith("🏁 Server-"):
+            try:
+                # Clear it from active memory if it's there
+                for group_id, data in list(active_groups.items()):
+                    if data["channel_id"] == vc.id:
+                        active_groups.pop(group_id, None)
+                        
+                await vc.delete()
+                print(f"[Cleanup Engine] Auto-cleaned empty orphaned channel: {vc.name}")
+            except Exception as e:
+                pass
+
+@bot.event
 async def on_ready():
     print(f"--- BOT ONLINE ---")
     print(f"User: {bot.user.name}")
     print(f"Target Category ID: {RACE_CATEGORY_ID}")
     print(f"Target Waiting Room ID: {WAITING_ROOM_VC_ID}")
+    
+    # --- STARTUP JANITOR SWEEP ---
+    guild = bot.guilds[0]
+    category = guild.get_channel(RACE_CATEGORY_ID)
+    if category:
+        for vc in category.voice_channels:
+            if vc.name.startswith("🏁 Server-") and len(vc.members) == 0:
+                try:
+                    await vc.delete()
+                    print(f"[Cleanup Engine] Swept old empty channel on startup: {vc.name}")
+                except Exception:
+                    pass
+    # -----------------------------
+    
     print(f"------------------")
     bot.loop.create_task(monitor_log_files())
 
