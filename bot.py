@@ -178,8 +178,12 @@ async def cleanup_race_vc(group_id):
                 except Exception:
                     pass
                     
-        await race_vc.delete()
-        print(f"Decommissioned channel parameters targeting session {group_id}")
+        # Added try...except block so it doesn't crash if the Auto-Cleaner got to it first
+        try:
+            await race_vc.delete()
+            print(f"Decommissioned channel parameters targeting session {group_id}")
+        except Exception:
+            pass
 
 async def monitor_log_files():
     await bot.wait_until_ready()
@@ -355,22 +359,32 @@ async def monitor_log_files():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # If someone left a voice channel
+    # If someone left a voice channel...
     if before.channel and before.channel != after.channel:
         vc = before.channel
         
-        # Safe Check: Is it empty AND did the bot create it?
-        if len(vc.members) == 0 and vc.name.startswith("🏁 Server-"):
+        # ...and that channel was a bot-created race server
+        if vc.name.startswith("🏁 Server-"):
+            
+            # 1. Instantly strip their RCB nickname since they left the track
             try:
-                # Clear it from active memory if it's there
-                for group_id, data in list(active_groups.items()):
-                    if data["channel_id"] == vc.id:
-                        active_groups.pop(group_id, None)
-                        
-                await vc.delete()
-                print(f"[Cleanup Engine] Auto-cleaned empty orphaned channel: {vc.name}")
-            except Exception as e:
+                if member.nick and member.nick.startswith("(RCB"):
+                    await member.edit(nick=None)
+            except Exception:
                 pass
+            
+            # 2. If they were the LAST person to leave, delete the ghost channel
+            if len(vc.members) == 0:
+                try:
+                    # Clear it from the bot's active memory if it's there
+                    for group_id, data in list(active_groups.items()):
+                        if data["channel_id"] == vc.id:
+                            active_groups.pop(group_id, None)
+                            
+                    await vc.delete()
+                    print(f"[Cleanup Engine] Auto-cleaned empty orphaned channel: {vc.name}")
+                except Exception:
+                    pass
 
 @bot.event
 async def on_ready():
