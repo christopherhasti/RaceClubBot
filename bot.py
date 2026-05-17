@@ -8,6 +8,12 @@ from discord.ext import commands
 
 # --- ENABLE BACKGROUND LOGGING ---
 log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot-diagnostics.txt")
+
+# Log Rotation: If the file is larger than 5MB, wipe it clean to save space
+if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > 5 * 1024 * 1024:
+    with open(log_file_path, "w", encoding="utf-8") as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log cleared (exceeded 5MB limit).\n")
+
 sys.stdout = open(log_file_path, "a", encoding="utf-8")
 sys.stderr = sys.stdout
 print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BOT PROCESS STARTED")
