@@ -119,17 +119,42 @@ async def schedule_cleanup(group_id, delay=0):
 
     cleanup_tasks[group_id] = bot.loop.create_task(task_wrapper())
 
+# --- NEW NICKNAME HELPER ---
+async def update_nickname_safe(member, new_nick, rig_tag):
+    """Background task to handle nickname rate limits safely without blocking the grid."""
+    try:
+        await member.edit(nick=new_nick)
+        if new_nick:
+            print(f"    [Profile Engine] Applied formatted tag: {rig_tag} -> {new_nick}")
+        else:
+            print(f"    [Profile Engine] Restored default display layer for dummy: {rig_tag}")
+    except Exception as e:
+        pass # discord.py handles 429s automatically internally
+
+# --- UPDATED SETUP FUNCTION ---
 async def setup_race_vc(group_id, staged_roster):
     guild = bot.guilds[0]
     category = guild.get_channel(RACE_CATEGORY_ID)
     
     if category is None:
         print(f"CRITICAL WARNING: Category ID {RACE_CATEGORY_ID} not found. Ensure it is correct in your .env file.")
+        return
         
     vc_name = f"🏁 Server-{group_id}"
-    race_vc = await guild.create_voice_channel(name=vc_name, category=category)
+    
+    # FIX 1: Check if the channel already exists to prevent duplicate ghost lobbies
+    existing_vc = discord.utils.get(category.voice_channels, name=vc_name)
+    if existing_vc:
+        race_vc = existing_vc
+        print(f"[Recovery Engine] Attached to existing channel: {vc_name}")
+    else:
+        race_vc = await guild.create_voice_channel(name=vc_name, category=category)
+        
     active_groups[group_id] = {"channel_id": race_vc.id}
     
+    members_to_rename = []
+    
+    # FIX 2: Route everyone instantly first so they aren't stuck in the waiting room
     for rig_tag, target_name in staged_roster.items():
         member = find_rig_member(guild, rig_tag)
         if member and member.voice and member.voice.channel:
@@ -137,24 +162,25 @@ async def setup_race_vc(group_id, staged_roster):
                 await member.move_to(race_vc)
                 print(f" -> Successfully routed {rig_tag} to grid.")
                 
+                # Stage the nickname data for later
                 if target_name and target_name.lower() != rig_tag.lower():
                     rig_display = rig_tag.replace("_", " ") 
                     
                     if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
-                        try:
-                            await member.edit(nick=None)
-                            print(f"    [Profile Engine] Restored default display layer for dummy: {rig_tag}")
-                        except Exception:
-                            pass
+                        members_to_rename.append((member, None, rig_tag))
                     else:
                         formatted_name = f"({rig_display}) {target_name}"[:32]
-                        try:
-                            await member.edit(nick=formatted_name)
-                            print(f"    [Profile Engine] Applied formatted tag: {rig_tag} -> {formatted_name}")
-                        except Exception:
-                            pass
+                        members_to_rename.append((member, formatted_name, rig_tag))
+            
+            except discord.errors.NotFound:
+                print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
+                break
             except Exception as e:
                 print(f" -> Gateway restriction transporting {rig_tag}: {e}")
+
+    # FIX 3: Fire off nickname changes as background tasks.
+    for member, new_nick, rig_tag in members_to_rename:
+        bot.loop.create_task(update_nickname_safe(member, new_nick, rig_tag))
 
 async def cleanup_race_vc(group_id):
     group_data = active_groups.pop(group_id, None)
@@ -178,7 +204,6 @@ async def cleanup_race_vc(group_id):
                 except Exception:
                     pass
                     
-        # Added try...except block so it doesn't crash if the Auto-Cleaner got to it first
         try:
             await race_vc.delete()
             print(f"Decommissioned channel parameters targeting session {group_id}")
@@ -304,7 +329,6 @@ async def monitor_log_files():
                     continue
 
                 # 5. BACKUP SYSTEM: CAR SELECTION TRANSITION TRIGGER
-                # If Ready Check was skipped, this catches the lobby transitioning to the race phase.
                 start_match = re.search(r"changing group state from CarSelection to (?:ServerCreation|Practice), group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                 if start_match:
                     group_id = start_match.group(1)
@@ -357,6 +381,7 @@ async def monitor_log_files():
             print("Restarting file stream connection in 5 seconds...")
             await asyncio.sleep(5)
 
+# --- UPDATED AUTO-CLEANER ---
 @bot.event
 async def on_voice_state_update(member, before, after):
     # If someone left a voice channel...
@@ -369,7 +394,8 @@ async def on_voice_state_update(member, before, after):
             # 1. Instantly strip their RCB nickname since they left the track
             try:
                 if member.nick and member.nick.startswith("(RCB"):
-                    await member.edit(nick=None)
+                    # Push to background task instead of awaiting directly to prevent hanging
+                    bot.loop.create_task(update_nickname_safe(member, None, member.name))
             except Exception:
                 pass
             
