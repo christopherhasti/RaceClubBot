@@ -142,7 +142,7 @@ async def setup_race_vc(group_id, staged_roster):
         
     vc_name = f"🏁 Server-{group_id}"
     
-    # FIX 1: Check if the channel already exists to prevent duplicate ghost lobbies
+    # Check if the channel already exists to prevent duplicate ghost lobbies
     existing_vc = discord.utils.get(category.voice_channels, name=vc_name)
     if existing_vc:
         race_vc = existing_vc
@@ -154,7 +154,7 @@ async def setup_race_vc(group_id, staged_roster):
     
     members_to_rename = []
     
-    # FIX 2: Route everyone instantly first so they aren't stuck in the waiting room
+    # Route everyone instantly first so they aren't stuck in the waiting room
     for rig_tag, target_name in staged_roster.items():
         member = find_rig_member(guild, rig_tag)
         if member and member.voice and member.voice.channel:
@@ -178,7 +178,7 @@ async def setup_race_vc(group_id, staged_roster):
             except Exception as e:
                 print(f" -> Gateway restriction transporting {rig_tag}: {e}")
 
-    # FIX 3: Fire off nickname changes as background tasks.
+    # Fire off nickname changes as background tasks.
     for member, new_nick, rig_tag in members_to_rename:
         bot.loop.create_task(update_nickname_safe(member, new_nick, rig_tag))
 
@@ -215,6 +215,7 @@ async def monitor_log_files():
     print(f"[Production Engine] Synchronizing with active logs at: {LOG_DIRECTORY}")
 
     while True:
+        file_handle = None # FIX: Track the file handle for safe closing
         try:
             global recent_vm_names
             current_path = get_active_log_path()
@@ -241,8 +242,7 @@ async def monitor_log_files():
                     active_path = get_active_log_path()
                     if active_path and active_path != current_path:
                         print(f"[Log Monitor] Sequence split detected. Shifting listener to: {os.path.basename(active_path)}")
-                        file_handle.close()
-                        break 
+                        break # Triggers finally block to close file
                         
                     await asyncio.sleep(0.1)
                     continue
@@ -277,18 +277,25 @@ async def monitor_log_files():
                     if not line.strip() or re.match(r"^\d{4}-\d{2}-\d{2}", line.strip()):
                         capturing_vm = False
                         
-                        # Backup System: Process Car Assignments
+                        # Backup System: Process Car Assignments (FIX: Safe List Mutation)
+                        items_to_remove = []
                         for slot_id, data in current_vm_block.items():
                             driver_name = data["driver"]
                             car_name = data["car"]
                             old_car = last_vm_state.get(slot_id, {}).get("car", "")
                             
                             if car_name and car_name != old_car:
-                                for i, (hw, applied_car) in enumerate(active_car_applies):
+                                for hw, applied_car in active_car_applies:
                                     if applied_car == car_name:
                                         current_group_roster[hw] = driver_name
-                                        active_car_applies.pop(i)
+                                        items_to_remove.append((hw, applied_car))
                                         break
+                                        
+                        # Safely clean up applied cars after iterating
+                        for item in items_to_remove:
+                            if item in active_car_applies:
+                                active_car_applies.remove(item)
+                                
                         last_vm_state = current_vm_block.copy()
                         
                     elif "Group state:" in line:
@@ -344,6 +351,9 @@ async def monitor_log_files():
                                 pending_groups[group_id][rig_account] = driver_name
                                 
                         setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
+                        
+                        # FIX: Purge roster accumulator so drivers aren't dragged into concurrent lobbies
+                        current_group_roster.clear()
                     continue
 
                 # 6. SESSION FINISHED COMMAND
@@ -380,6 +390,14 @@ async def monitor_log_files():
             print(f"[CRITICAL SYSTEM RECOVERY] Log monitor encountered a fatal OS error: {e}")
             print("Restarting file stream connection in 5 seconds...")
             await asyncio.sleep(5)
+            
+        # FIX: Ensure the file is closed properly to prevent Windows file lock
+        finally:
+            if file_handle is not None and not file_handle.closed:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
 
 # --- UPDATED AUTO-CLEANER ---
 @bot.event
