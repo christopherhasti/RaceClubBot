@@ -119,7 +119,6 @@ async def schedule_cleanup(group_id, delay=0):
 
     cleanup_tasks[group_id] = bot.loop.create_task(task_wrapper())
 
-# --- NEW NICKNAME HELPER ---
 async def update_nickname_safe(member, new_nick, rig_tag):
     """Background task to handle nickname rate limits safely without blocking the grid."""
     try:
@@ -128,10 +127,9 @@ async def update_nickname_safe(member, new_nick, rig_tag):
             print(f"    [Profile Engine] Applied formatted tag: {rig_tag} -> {new_nick}")
         else:
             print(f"    [Profile Engine] Restored default display layer for dummy: {rig_tag}")
-    except Exception as e:
+    except Exception:
         pass # discord.py handles 429s automatically internally
 
-# --- UPDATED SETUP FUNCTION ---
 async def setup_race_vc(group_id, staged_roster):
     guild = bot.guilds[0]
     category = guild.get_channel(RACE_CATEGORY_ID)
@@ -142,7 +140,6 @@ async def setup_race_vc(group_id, staged_roster):
         
     vc_name = f"🏁 Server-{group_id}"
     
-    # Check if the channel already exists to prevent duplicate ghost lobbies
     existing_vc = discord.utils.get(category.voice_channels, name=vc_name)
     if existing_vc:
         race_vc = existing_vc
@@ -150,35 +147,43 @@ async def setup_race_vc(group_id, staged_roster):
     else:
         race_vc = await guild.create_voice_channel(name=vc_name, category=category)
         
-    active_groups[group_id] = {"channel_id": race_vc.id}
+    # NEW: The Setup Shield lock prevents Auto-cleaner from deleting a channel mid-build
+    active_groups[group_id] = {"channel_id": race_vc.id, "setup_complete": False}
     
     members_to_rename = []
     
-    # Route everyone instantly first so they aren't stuck in the waiting room
-    for rig_tag, target_name in staged_roster.items():
-        member = find_rig_member(guild, rig_tag)
-        if member and member.voice and member.voice.channel:
-            try:
-                await member.move_to(race_vc)
-                print(f" -> Successfully routed {rig_tag} to grid.")
-                
-                # Stage the nickname data for later
-                if target_name and target_name.lower() != rig_tag.lower():
-                    rig_display = rig_tag.replace("_", " ") 
+    try:
+        for rig_tag, target_name in staged_roster.items():
+            member = find_rig_member(guild, rig_tag)
+            if member and member.voice and member.voice.channel:
+                try:
+                    await member.move_to(race_vc)
+                    print(f" -> Successfully routed {rig_tag} to grid.")
                     
-                    if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
-                        members_to_rename.append((member, None, rig_tag))
-                    else:
-                        formatted_name = f"({rig_display}) {target_name}"[:32]
-                        members_to_rename.append((member, formatted_name, rig_tag))
-            
-            except discord.errors.NotFound:
-                print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
-                break
-            except Exception as e:
-                print(f" -> Gateway restriction transporting {rig_tag}: {e}")
+                    if target_name and target_name.lower() != rig_tag.lower():
+                        rig_display = rig_tag.replace("_", " ") 
+                        
+                        if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
+                            members_to_rename.append((member, None, rig_tag))
+                        else:
+                            formatted_name = f"({rig_display}) {target_name}"[:32]
+                            members_to_rename.append((member, formatted_name, rig_tag))
+                
+                except discord.errors.NotFound:
+                    print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
+                    break
+                except Exception as e:
+                    # Catch 10003 Unknown Channel errors cleanly
+                    if hasattr(e, 'code') and e.code == 10003:
+                        print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
+                        break
+                    print(f" -> Gateway restriction transporting {rig_tag}: {e}")
+                    
+    finally:
+        # Unlock the channel once routing is finished so the Auto-cleaner can work again
+        if group_id in active_groups:
+            active_groups[group_id]["setup_complete"] = True
 
-    # Fire off nickname changes as background tasks.
     for member, new_nick, rig_tag in members_to_rename:
         bot.loop.create_task(update_nickname_safe(member, new_nick, rig_tag))
 
@@ -194,13 +199,16 @@ async def cleanup_race_vc(group_id):
     if race_vc:
         for member in list(race_vc.members):
             try:
-                await member.edit(nick=None) 
+                # RE-APPLIED: Push to background task to prevent the 80-second rate limit freeze
+                bot.loop.create_task(update_nickname_safe(member, None, member.name))
             except Exception:
                 pass
             
             if waiting_room_vc:
                 try:
-                    await member.move_to(waiting_room_vc)
+                    # RE-APPLIED: Only move them to waiting room if they are still actually in the old channel
+                    if member.voice and member.voice.channel and member.voice.channel.id == race_vc.id:
+                        await member.move_to(waiting_room_vc)
                 except Exception:
                     pass
                     
@@ -215,7 +223,7 @@ async def monitor_log_files():
     print(f"[Production Engine] Synchronizing with active logs at: {LOG_DIRECTORY}")
 
     while True:
-        file_handle = None # FIX: Track the file handle for safe closing
+        file_handle = None 
         try:
             global recent_vm_names
             current_path = get_active_log_path()
@@ -227,7 +235,6 @@ async def monitor_log_files():
             file_handle = open(current_path, "r", encoding="utf-8", errors="replace")
             file_handle.seek(0, os.SEEK_END)
 
-            # Tracker variables for Backup System
             capturing_vm = False
             current_vm_block = {}
             last_vm_state = {}
@@ -242,14 +249,13 @@ async def monitor_log_files():
                     active_path = get_active_log_path()
                     if active_path and active_path != current_path:
                         print(f"[Log Monitor] Sequence split detected. Shifting listener to: {os.path.basename(active_path)}")
-                        break # Triggers finally block to close file
+                        break 
                         
                     await asyncio.sleep(0.1)
                     continue
 
                 line_lower = line.lower()
 
-                # 1. LIVE HARDWARE DISCOVERY
                 conn_match = re.search(r"Launcher\s+(RCB[\w\s]+)\s+\(([a-z0-9]+)\)\s+connected", line, re.IGNORECASE)
                 if conn_match:
                     raw_name = conn_match.group(1).strip()
@@ -258,7 +264,6 @@ async def monitor_log_files():
                     hardware_map[hw_code] = formatted_rig
                     continue
 
-                # 2. CAR APPLIED INTERCEPTOR (Backup System)
                 car_apply_match = re.search(r"Launcher\s+([a-z0-9]+)\s+car applied\s+(.+)", line, re.IGNORECASE)
                 if car_apply_match:
                     hw_code = car_apply_match.group(1).lower()
@@ -266,7 +271,6 @@ async def monitor_log_files():
                     active_car_applies.append((hw_code, car_name))
                     continue
 
-                # 3. [ACGroupVM] STATE TRACKER
                 if "[ACGroupVM]" in line:
                     capturing_vm = True
                     recent_vm_names = {}
@@ -277,7 +281,6 @@ async def monitor_log_files():
                     if not line.strip() or re.match(r"^\d{4}-\d{2}-\d{2}", line.strip()):
                         capturing_vm = False
                         
-                        # Backup System: Process Car Assignments (FIX: Safe List Mutation)
                         items_to_remove = []
                         for slot_id, data in current_vm_block.items():
                             driver_name = data["driver"]
@@ -291,7 +294,6 @@ async def monitor_log_files():
                                         items_to_remove.append((hw, applied_car))
                                         break
                                         
-                        # Safely clean up applied cars after iterating
                         for item in items_to_remove:
                             if item in active_car_applies:
                                 active_car_applies.remove(item)
@@ -315,7 +317,6 @@ async def monitor_log_files():
                             current_vm_block[slot_index] = {"driver": extracted_name, "car": car_name}
                         continue
 
-                # 4. PRIMARY SYSTEM: READY CHECK TRIGGER
                 ready_match = re.search(r"Send start Ready Check to slot (\d+),\s*([a-z0-9]+),\s*group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                 if ready_match:
                     slot_id = int(ready_match.group(1))
@@ -335,12 +336,10 @@ async def monitor_log_files():
                             setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
                     continue
 
-                # 5. BACKUP SYSTEM: CAR SELECTION TRANSITION TRIGGER
                 start_match = re.search(r"changing group state from CarSelection to (?:ServerCreation|Practice), group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                 if start_match:
                     group_id = start_match.group(1)
                     
-                    # Only execute backup if Primary System hasn't already handled this lobby
                     if current_group_roster and not any(k.lower() == group_id.lower() for k in active_groups) and group_id not in setup_tasks:
                         print(f"[Grid Staged - BACKUP] Ready Check bypassed. Using live car telemetry for session {group_id}.")
                         pending_groups[group_id] = {}
@@ -352,11 +351,9 @@ async def monitor_log_files():
                                 
                         setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
                         
-                        # FIX: Purge roster accumulator so drivers aren't dragged into concurrent lobbies
                         current_group_roster.clear()
                     continue
 
-                # 6. SESSION FINISHED COMMAND
                 if "to finished" in line_lower:
                     finish_match = re.search(r"group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                     if finish_match:
@@ -366,7 +363,6 @@ async def monitor_log_files():
                             await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
                     continue
 
-                # 7. TRUE SESSION DELETION COMMAND
                 if "removed" in line_lower:
                     teardown_match = re.search(r"group\s+([A-Za-z0-9_\-]+)\s+removed", line, re.IGNORECASE)
                     if teardown_match:
@@ -391,7 +387,6 @@ async def monitor_log_files():
             print("Restarting file stream connection in 5 seconds...")
             await asyncio.sleep(5)
             
-        # FIX: Ensure the file is closed properly to prevent Windows file lock
         finally:
             if file_handle is not None and not file_handle.closed:
                 try:
@@ -399,28 +394,32 @@ async def monitor_log_files():
                 except Exception:
                     pass
 
-# --- UPDATED AUTO-CLEANER ---
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # If someone left a voice channel...
     if before.channel and before.channel != after.channel:
         vc = before.channel
         
-        # ...and that channel was a bot-created race server
         if vc.name.startswith("🏁 Server-"):
             
-            # 1. Instantly strip their RCB nickname since they left the track
             try:
                 if member.nick and member.nick.startswith("(RCB"):
-                    # Push to background task instead of awaiting directly to prevent hanging
                     bot.loop.create_task(update_nickname_safe(member, None, member.name))
             except Exception:
                 pass
             
-            # 2. If they were the LAST person to leave, delete the ghost channel
             if len(vc.members) == 0:
+                # NEW: Check the Setup Shield lock. If the channel is currently being built, ABORT cleanup.
+                is_building = False
+                for group_id, data in list(active_groups.items()):
+                    if data["channel_id"] == vc.id:
+                        if not data.get("setup_complete", False):
+                            is_building = True
+                            print(f"[Cleanup Engine] Shielded {vc.name} from deletion (Setup in progress).")
+                            break
+                if is_building:
+                    return
+
                 try:
-                    # Clear it from the bot's active memory if it's there
                     for group_id, data in list(active_groups.items()):
                         if data["channel_id"] == vc.id:
                             active_groups.pop(group_id, None)
@@ -437,7 +436,6 @@ async def on_ready():
     print(f"Target Category ID: {RACE_CATEGORY_ID}")
     print(f"Target Waiting Room ID: {WAITING_ROOM_VC_ID}")
     
-    # --- STARTUP JANITOR SWEEP ---
     guild = bot.guilds[0]
     category = guild.get_channel(RACE_CATEGORY_ID)
     if category:
@@ -448,7 +446,6 @@ async def on_ready():
                     print(f"[Cleanup Engine] Swept old empty channel on startup: {vc.name}")
                 except Exception:
                     pass
-    # -----------------------------
     
     print(f"------------------")
     bot.loop.create_task(monitor_log_files())
