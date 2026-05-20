@@ -14,7 +14,7 @@ if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > 5 * 1024 *
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log cleared (exceeded 5MB limit).\n")
 
-# NEW: FlushLogger forces Python to write logs to the text file instantly instead of buffering them
+# FlushLogger forces Python to write logs to the text file instantly instead of buffering them
 class FlushLogger:
     def __init__(self, filename):
         self.log = open(filename, "a", encoding="utf-8")
@@ -174,7 +174,6 @@ async def setup_race_vc(group_id, staged_roster):
             if member and member.voice and member.voice.channel:
                 
                 # THE WAITING ROOM LOCK
-                # The bot will physically refuse to move the user if they are sitting in an active race or general channel.
                 if member.voice.channel.id not in [WAITING_ROOM_VC_ID, race_vc.id]:
                     print(f" -> Skipped {rig_tag}: Currently occupied in {member.voice.channel.name}, not in Waiting Room.")
                     continue
@@ -192,6 +191,19 @@ async def setup_race_vc(group_id, staged_roster):
         
         if tasks:
             await asyncio.gather(*tasks)
+            
+        # --- NEW: GHOST LOBBY SWEEPER ---
+        # Wait a fraction of a second for Discord's member cache to update
+        await asyncio.sleep(0.5)
+        if len(race_vc.members) == 0:
+            print(f"[Cleanup Engine] No valid drivers routed. Sweeping empty ghost lobby: {vc_name}")
+            active_groups.pop(group_id, None) # Remove it from internal memory
+            try:
+                await race_vc.delete()
+            except Exception:
+                pass
+            return # Exit out completely so the "finally" block doesn't unlock a deleted channel
+        # --------------------------------
             
     finally:
         if group_id in active_groups:
