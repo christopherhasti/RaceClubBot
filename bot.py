@@ -137,7 +137,7 @@ async def schedule_cleanup(group_id, delay=0):
 
     cleanup_tasks[group_id] = bot.loop.create_task(task_wrapper())
 
-# NEW: Combines move and rename into one highly-efficient API call
+# Combines move and rename into one highly-efficient API call
 async def route_and_rename(member, race_vc, new_nick, rig_tag):
     try:
         await member.edit(voice_channel=race_vc, nick=new_nick)
@@ -172,6 +172,13 @@ async def setup_race_vc(group_id, staged_roster):
         for rig_tag, target_name in staged_roster.items():
             member = find_rig_member(guild, rig_tag)
             if member and member.voice and member.voice.channel:
+                
+                # THE WAITING ROOM LOCK
+                # The bot will physically refuse to move the user if they are sitting in an active race or general channel.
+                if member.voice.channel.id not in [WAITING_ROOM_VC_ID, race_vc.id]:
+                    print(f" -> Skipped {rig_tag}: Currently occupied in {member.voice.channel.name}, not in Waiting Room.")
+                    continue
+
                 new_nick = member.nick
                 if target_name and target_name.lower() != rig_tag.lower():
                     rig_display = rig_tag.replace("_", " ") 
@@ -190,7 +197,7 @@ async def setup_race_vc(group_id, staged_roster):
         if group_id in active_groups:
             active_groups[group_id]["setup_complete"] = True
 
-# NEW: Background task to pull users safely to the waiting room and strip names in one call
+# Background task to pull users safely to the waiting room and strip names in one call
 async def cleanup_member(member, waiting_room_vc, race_vc_id):
     try:
         if waiting_room_vc and member.voice and member.voice.channel and member.voice.channel.id == race_vc_id:
@@ -217,7 +224,7 @@ async def cleanup_race_vc(group_id):
         # Give Discord's cache a split second to sync after the mass move
         await asyncio.sleep(0.5)
         
-        # NEW: The Safety Shield. Physically blocks channel deletion if anyone is stranded.
+        # The Safety Shield. Physically blocks channel deletion if anyone is stranded.
         if len(race_vc.members) == 0:
             try:
                 await race_vc.delete()
