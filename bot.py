@@ -192,18 +192,17 @@ async def setup_race_vc(group_id, staged_roster):
         if tasks:
             await asyncio.gather(*tasks)
             
-        # --- NEW: GHOST LOBBY SWEEPER ---
-        # Wait a fraction of a second for Discord's member cache to update
+        # --- GHOST LOBBY SWEEPER ---
         await asyncio.sleep(0.5)
         if len(race_vc.members) == 0:
             print(f"[Cleanup Engine] No valid drivers routed. Sweeping empty ghost lobby: {vc_name}")
-            active_groups.pop(group_id, None) # Remove it from internal memory
+            active_groups.pop(group_id, None)
             try:
                 await race_vc.delete()
             except Exception:
                 pass
-            return # Exit out completely so the "finally" block doesn't unlock a deleted channel
-        # --------------------------------
+            return 
+        # ---------------------------
             
     finally:
         if group_id in active_groups:
@@ -233,10 +232,8 @@ async def cleanup_race_vc(group_id):
         if tasks:
             await asyncio.gather(*tasks)
             
-        # Give Discord's cache a split second to sync after the mass move
         await asyncio.sleep(0.5)
         
-        # The Safety Shield. Physically blocks channel deletion if anyone is stranded.
         if len(race_vc.members) == 0:
             try:
                 await race_vc.delete()
@@ -444,9 +441,11 @@ async def on_voice_state_update(member, before, after):
                             is_building = True
                             print(f"[Cleanup Engine] Shielded {vc.name} from deletion (Setup in progress).")
                             break
+                
                 if is_building:
                     return
 
+                # If it's a 🏁 Server- and it's empty, ruthlessly delete it.
                 try:
                     for group_id, data in list(active_groups.items()):
                         if data["channel_id"] == vc.id:
