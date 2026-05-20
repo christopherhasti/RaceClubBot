@@ -14,8 +14,26 @@ if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > 5 * 1024 *
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log cleared (exceeded 5MB limit).\n")
 
-sys.stdout = open(log_file_path, "a", encoding="utf-8")
+# NEW: FlushLogger forces Python to write logs to the text file instantly instead of buffering them
+class FlushLogger:
+    def __init__(self, filename):
+        self.log = open(filename, "a", encoding="utf-8")
+        self.terminal = sys.stdout
+
+    def write(self, message):
+        if self.terminal:
+            self.terminal.write(message)
+        self.log.write(message)
+        self.flush()
+
+    def flush(self):
+        if self.terminal:
+            self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = FlushLogger(log_file_path)
 sys.stderr = sys.stdout
+
 print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BOT PROCESS STARTED")
 # ---------------------------------
 
@@ -119,16 +137,16 @@ async def schedule_cleanup(group_id, delay=0):
 
     cleanup_tasks[group_id] = bot.loop.create_task(task_wrapper())
 
-async def update_nickname_safe(member, new_nick, rig_tag):
-    """Background task to handle nickname rate limits safely without blocking the grid."""
+# NEW: Combines move and rename into one highly-efficient API call
+async def route_and_rename(member, race_vc, new_nick, rig_tag):
     try:
-        await member.edit(nick=new_nick)
-        if new_nick:
-            print(f"    [Profile Engine] Applied formatted tag: {rig_tag} -> {new_nick}")
+        await member.edit(voice_channel=race_vc, nick=new_nick)
+        print(f" -> Successfully routed and formatted {rig_tag}.")
+    except Exception as e:
+        if hasattr(e, 'code') and e.code == 10003:
+            print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting.")
         else:
-            print(f"    [Profile Engine] Restored default display layer for dummy: {rig_tag}")
-    except Exception:
-        pass # discord.py handles 429s automatically internally
+            print(f" -> Gateway restriction transporting {rig_tag}: {e}")
 
 async def setup_race_vc(group_id, staged_roster):
     guild = bot.guilds[0]
@@ -147,45 +165,40 @@ async def setup_race_vc(group_id, staged_roster):
     else:
         race_vc = await guild.create_voice_channel(name=vc_name, category=category)
         
-    # NEW: The Setup Shield lock prevents Auto-cleaner from deleting a channel mid-build
     active_groups[group_id] = {"channel_id": race_vc.id, "setup_complete": False}
     
-    members_to_rename = []
-    
     try:
+        tasks = []
         for rig_tag, target_name in staged_roster.items():
             member = find_rig_member(guild, rig_tag)
             if member and member.voice and member.voice.channel:
-                try:
-                    await member.move_to(race_vc)
-                    print(f" -> Successfully routed {rig_tag} to grid.")
-                    
-                    if target_name and target_name.lower() != rig_tag.lower():
-                        rig_display = rig_tag.replace("_", " ") 
-                        
-                        if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
-                            members_to_rename.append((member, None, rig_tag))
-                        else:
-                            formatted_name = f"({rig_display}) {target_name}"[:32]
-                            members_to_rename.append((member, formatted_name, rig_tag))
+                new_nick = member.nick
+                if target_name and target_name.lower() != rig_tag.lower():
+                    rig_display = rig_tag.replace("_", " ") 
+                    if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
+                        new_nick = None
+                    else:
+                        new_nick = f"({rig_display}) {target_name}"[:32]
                 
-                except discord.errors.NotFound:
-                    print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
-                    break
-                except Exception as e:
-                    # Catch 10003 Unknown Channel errors cleanly
-                    if hasattr(e, 'code') and e.code == 10003:
-                        print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting route.")
-                        break
-                    print(f" -> Gateway restriction transporting {rig_tag}: {e}")
-                    
+                # Bundle the tasks to execute concurrently
+                tasks.append(route_and_rename(member, race_vc, new_nick, rig_tag))
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+            
     finally:
-        # Unlock the channel once routing is finished so the Auto-cleaner can work again
         if group_id in active_groups:
             active_groups[group_id]["setup_complete"] = True
 
-    for member, new_nick, rig_tag in members_to_rename:
-        bot.loop.create_task(update_nickname_safe(member, new_nick, rig_tag))
+# NEW: Background task to pull users safely to the waiting room and strip names in one call
+async def cleanup_member(member, waiting_room_vc, race_vc_id):
+    try:
+        if waiting_room_vc and member.voice and member.voice.channel and member.voice.channel.id == race_vc_id:
+            await member.edit(nick=None, voice_channel=waiting_room_vc)
+        else:
+            await member.edit(nick=None)
+    except Exception as e:
+        print(f" -> Failed to cleanup {member.name}: {e}")
 
 async def cleanup_race_vc(group_id):
     group_data = active_groups.pop(group_id, None)
@@ -197,26 +210,22 @@ async def cleanup_race_vc(group_id):
     waiting_room_vc = guild.get_channel(WAITING_ROOM_VC_ID)
     
     if race_vc:
-        for member in list(race_vc.members):
+        tasks = [cleanup_member(m, waiting_room_vc, race_vc.id) for m in list(race_vc.members)]
+        if tasks:
+            await asyncio.gather(*tasks)
+            
+        # Give Discord's cache a split second to sync after the mass move
+        await asyncio.sleep(0.5)
+        
+        # NEW: The Safety Shield. Physically blocks channel deletion if anyone is stranded.
+        if len(race_vc.members) == 0:
             try:
-                # RE-APPLIED: Push to background task to prevent the 80-second rate limit freeze
-                bot.loop.create_task(update_nickname_safe(member, None, member.name))
+                await race_vc.delete()
+                print(f"Decommissioned channel parameters targeting session {group_id}")
             except Exception:
                 pass
-            
-            if waiting_room_vc:
-                try:
-                    # RE-APPLIED: Only move them to waiting room if they are still actually in the old channel
-                    if member.voice and member.voice.channel and member.voice.channel.id == race_vc.id:
-                        await member.move_to(waiting_room_vc)
-                except Exception:
-                    pass
-                    
-        try:
-            await race_vc.delete()
-            print(f"Decommissioned channel parameters targeting session {group_id}")
-        except Exception:
-            pass
+        else:
+            print(f"[Safety Shield] Channel {race_vc.name} still has {len(race_vc.members)} members. Aborting deletion to prevent stranding.")
 
 async def monitor_log_files():
     await bot.wait_until_ready()
@@ -401,14 +410,14 @@ async def on_voice_state_update(member, before, after):
         
         if vc.name.startswith("🏁 Server-"):
             
+            # Instantly strip their RCB nickname since they left the track
             try:
                 if member.nick and member.nick.startswith("(RCB"):
-                    bot.loop.create_task(update_nickname_safe(member, None, member.name))
+                    bot.loop.create_task(member.edit(nick=None))
             except Exception:
                 pass
             
             if len(vc.members) == 0:
-                # NEW: Check the Setup Shield lock. If the channel is currently being built, ABORT cleanup.
                 is_building = False
                 for group_id, data in list(active_groups.items()):
                     if data["channel_id"] == vc.id:
