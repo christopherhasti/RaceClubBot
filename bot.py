@@ -31,6 +31,11 @@ class FlushLogger:
             self.terminal.flush()
         self.log.flush()
 
+    def close(self):
+        if self.log and not self.log.closed:
+            self.log.flush()
+            self.log.close()
+
 sys.stdout = FlushLogger(log_file_path)
 sys.stderr = sys.stdout
 
@@ -50,11 +55,16 @@ def get_env_int(key, default=0):
     val = os.environ.get(key)
     return int(val) if val and val.isdigit() else default
 
+GUILD_ID = get_env_int("GUILD_ID")
 WAITING_ROOM_VC_ID = get_env_int("WAITING_ROOM_VC_ID")
 RACE_CATEGORY_ID = get_env_int("RACE_CATEGORY_ID")
 
 POST_RACE_GRACE_SECONDS = 45
 LOG_DIRECTORY = os.path.join(os.path.expanduser("~"), "Documents", "LoungeControl", "Server", "logs")
+
+import json
+
+HARDWARE_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hardware_map.json")
 
 hardware_map = {
     "e5jgr10z2sx": "RCB_1",
@@ -69,6 +79,22 @@ hardware_map = {
     "xlhnpe0uotp": "RCB_10",
     "cj4pvupxyq1": "RCB_11"
 }
+
+# Merge any previously persisted hardware codes on top of the defaults
+if os.path.exists(HARDWARE_MAP_PATH):
+    try:
+        with open(HARDWARE_MAP_PATH, "r", encoding="utf-8") as f:
+            hardware_map.update(json.load(f))
+        print(f"[Hardware Map] Loaded {len(hardware_map)} entries from disk.")
+    except Exception as e:
+        print(f"[Hardware Map] Failed to load persisted map: {e}")
+
+def save_hardware_map():
+    try:
+        with open(HARDWARE_MAP_PATH, "w", encoding="utf-8") as f:
+            json.dump(hardware_map, f, indent=2)
+    except Exception as e:
+        print(f"[Hardware Map] Failed to persist map: {e}")
 
 pending_groups = {}
 recent_vm_names = {}
@@ -149,7 +175,10 @@ async def route_and_rename(member, race_vc, new_nick, rig_tag):
             print(f" -> Gateway restriction transporting {rig_tag}: {e}")
 
 async def setup_race_vc(group_id, staged_roster):
-    guild = bot.guilds[0]
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        print(f"CRITICAL WARNING: Guild ID {GUILD_ID} not found. Ensure GUILD_ID is correct in your .env file.")
+        return
     category = guild.get_channel(RACE_CATEGORY_ID)
     
     if category is None:
@@ -222,7 +251,10 @@ async def cleanup_race_vc(group_id):
     if not group_data:
         return
         
-    guild = bot.guilds[0]
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        print(f"CRITICAL WARNING: Guild ID {GUILD_ID} not found during cleanup for session {group_id}.")
+        return
     race_vc = guild.get_channel(group_data["channel_id"])
     waiting_room_vc = guild.get_channel(WAITING_ROOM_VC_ID)
     
@@ -258,7 +290,6 @@ async def monitor_log_files():
     while True:
         file_handle = None 
         try:
-            global recent_vm_names
             current_path = get_active_log_path()
             while not current_path or not os.path.exists(current_path):
                 await asyncio.sleep(2)
@@ -269,7 +300,6 @@ async def monitor_log_files():
             file_handle.seek(0, os.SEEK_END)
 
             while True:
-                file_handle.seek(file_handle.tell())
                 line = file_handle.readline()
                 
                 if not line:
@@ -289,6 +319,7 @@ async def monitor_log_files():
                     hw_code = conn_match.group(2).lower()
                     formatted_rig = raw_name.replace(" ", "_")
                     hardware_map[hw_code] = formatted_rig
+                    save_hardware_map()
                     continue
 
                 car_apply_match = re.search(r"Launcher\s+([a-z0-9]+)\s+car applied\s+(.+)", line, re.IGNORECASE)
@@ -466,7 +497,10 @@ async def on_ready():
     print(f"Target Category ID: {RACE_CATEGORY_ID}")
     print(f"Target Waiting Room ID: {WAITING_ROOM_VC_ID}")
     
-    guild = bot.guilds[0]
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        print(f"CRITICAL WARNING: Guild ID {GUILD_ID} not found. Check your .env file.")
+        return
     category = guild.get_channel(RACE_CATEGORY_ID)
     if category:
         for vc in category.voice_channels:
