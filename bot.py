@@ -168,7 +168,8 @@ async def setup_race_vc(group_id, staged_roster):
     active_groups[group_id] = {"channel_id": race_vc.id, "setup_complete": False}
     
     try:
-        tasks = []
+        # FIX: Replaced concurrent execution (gather) with a sequential loop 
+        # to prevent Discord HTTP 429 Rate Limits from forcefully disconnecting users.
         for rig_tag, target_name in staged_roster.items():
             member = find_rig_member(guild, rig_tag)
             if member and member.voice and member.voice.channel:
@@ -186,11 +187,9 @@ async def setup_race_vc(group_id, staged_roster):
                     else:
                         new_nick = f"({rig_display}) {target_name}"[:32]
                 
-                # Bundle the tasks to execute concurrently
-                tasks.append(route_and_rename(member, race_vc, new_nick, rig_tag))
-        
-        if tasks:
-            await asyncio.gather(*tasks)
+                # Route the member and apply a slight delay to respect API limits
+                await route_and_rename(member, race_vc, new_nick, rig_tag)
+                await asyncio.sleep(0.6) 
             
         # --- GHOST LOBBY SWEEPER ---
         await asyncio.sleep(0.5)
@@ -228,9 +227,10 @@ async def cleanup_race_vc(group_id):
     waiting_room_vc = guild.get_channel(WAITING_ROOM_VC_ID)
     
     if race_vc:
-        tasks = [cleanup_member(m, waiting_room_vc, race_vc.id) for m in list(race_vc.members)]
-        if tasks:
-            await asyncio.gather(*tasks)
+        # FIX: Also replace concurrent execution here with a sequential cleanup
+        for m in list(race_vc.members):
+            await cleanup_member(m, waiting_room_vc, race_vc.id)
+            await asyncio.sleep(0.6) 
             
         await asyncio.sleep(0.5)
         
@@ -247,6 +247,14 @@ async def monitor_log_files():
     await bot.wait_until_ready()
     print(f"[Production Engine] Synchronizing with active logs at: {LOG_DIRECTORY}")
 
+    # FIX: Move state variables OUTSIDE the log rotation while loop 
+    # so the bot doesn't forget who is racing at midnight.
+    capturing_vm = False
+    current_vm_block = {}
+    last_vm_state = {}
+    active_car_applies = []
+    current_group_roster = {}
+
     while True:
         file_handle = None 
         try:
@@ -259,12 +267,6 @@ async def monitor_log_files():
             print(f"[Log Monitor] Attached to file stream: {os.path.basename(current_path)}")
             file_handle = open(current_path, "r", encoding="utf-8", errors="replace")
             file_handle.seek(0, os.SEEK_END)
-
-            capturing_vm = False
-            current_vm_block = {}
-            last_vm_state = {}
-            active_car_applies = []
-            current_group_roster = {}
 
             while True:
                 file_handle.seek(file_handle.tell())
@@ -298,7 +300,8 @@ async def monitor_log_files():
 
                 if "[ACGroupVM]" in line:
                     capturing_vm = True
-                    recent_vm_names = {}
+                    # FIX: Removed `recent_vm_names = {}` here so it doesn't wipe names
+                    # immediately prior to a ready check processing.
                     current_vm_block = {}
                     continue
                     
