@@ -527,13 +527,12 @@ async def monitor_log_files():
                         current_group_roster.clear()
                     continue
 
-                if "to finished" in line_lower:
-                    finish_match = re.search(r"group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
-                    if finish_match:
-                        extracted_id = finish_match.group(1)
-                        target_key = next((k for k in active_groups if k.lower() == extracted_id.lower()), None)
-                        if target_key:
-                            await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
+                finish_match = re.search(r"changing group state from \w+ to Finished, group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
+                if finish_match:
+                    extracted_id = finish_match.group(1)
+                    target_key = next((k for k in active_groups if k.lower() == extracted_id.lower()), None)
+                    if target_key:
+                        await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
                     continue
 
                 if "removed" in line_lower:
