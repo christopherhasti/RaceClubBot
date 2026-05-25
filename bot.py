@@ -32,14 +32,42 @@ if os.path.exists(log_file_path) and os.path.getsize(log_file_path) > 5 * 1024 *
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log cleared (exceeded 5MB limit).\n")
 
 class FlushLogger:
+    """Wraps stdout/stderr so every line gets prefixed with a timestamp and the
+    bot's PID. The PID prefix means if two bot processes ever end up writing
+    to the same diagnostic file (the duplicate-instance bug Fix #1 catches),
+    the duplication is visible at a glance instead of inferred."""
+
     def __init__(self, filename):
         self.log = open(filename, "a", encoding="utf-8")
         self.terminal = sys.stdout
+        self.pid = os.getpid()
+        self._at_line_start = True
+
+    def _prefix(self):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"[{ts}] [PID {self.pid}] "
 
     def write(self, message):
+        if not message:
+            return
+        # Split on newlines and prepend a prefix at the start of every line.
+        # Tracks _at_line_start across calls because print() typically writes
+        # the message and the trailing newline in separate write() calls.
+        parts = message.split("\n")
+        out_parts = []
+        for i, part in enumerate(parts):
+            if i > 0:
+                out_parts.append("\n")
+                self._at_line_start = True
+            if part:
+                if self._at_line_start:
+                    out_parts.append(self._prefix())
+                    self._at_line_start = False
+                out_parts.append(part)
+        out = "".join(out_parts)
         if self.terminal:
-            self.terminal.write(message)
-        self.log.write(message)
+            self.terminal.write(out)
+        self.log.write(out)
         self.flush()
 
     def flush(self):
@@ -55,7 +83,7 @@ class FlushLogger:
 sys.stdout = FlushLogger(log_file_path)
 sys.stderr = sys.stdout
 
-print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BOT PROCESS STARTED (lock port {_LOCK_PORT})")
+print(f"BOT PROCESS STARTED (lock port {_LOCK_PORT})")
 
 # --- ENVIRONMENT CONFIGURATION ---
 if os.path.exists(".env"):
@@ -186,16 +214,17 @@ async def schedule_cleanup(group_id, delay=0):
 
     cleanup_tasks[group_id] = bot.loop.create_task(task_wrapper())
 
-async def route_and_rename(member, race_vc, new_nick, rig_tag):
+async def route_and_rename(member, race_vc, new_nick, rig_tag, group_id):
     try:
         await member.edit(voice_channel=race_vc, nick=new_nick)
-        print(f" -> Successfully routed and formatted {rig_tag}.")
+        nick_str = f"'{new_nick}'" if new_nick else "(cleared)"
+        print(f" -> [{group_id}] Routed {rig_tag} → nick={nick_str}.")
         return True
     except Exception as e:
         if hasattr(e, 'code') and e.code == 10003:
-            print(f" -> Channel deleted mid-routing for {rig_tag}. Aborting.")
+            print(f" -> [{group_id}] Channel deleted mid-routing for {rig_tag}. Aborting.")
         else:
-            print(f" -> Gateway restriction transporting {rig_tag}: {e}")
+            print(f" -> [{group_id}] Gateway restriction transporting {rig_tag}: {e}")
         return False
 
 async def setup_race_vc(group_id, staged_roster):
@@ -232,7 +261,7 @@ async def setup_race_vc(group_id, staged_roster):
                 continue
 
             if member.voice.channel.id not in [WAITING_ROOM_VC_ID, race_vc.id]:
-                print(f" -> Skipped {rig_tag}: Currently occupied in {member.voice.channel.name}, not in Waiting Room.")
+                print(f" -> [{group_id}] Skipped {rig_tag}: Currently occupied in {member.voice.channel.name}, not in Waiting Room.")
                 continue
 
             new_nick = compute_nick(rig_tag, target_name)
@@ -240,7 +269,7 @@ async def setup_race_vc(group_id, staged_roster):
                 # Preserve a manually-set nickname that isn't a bot-managed (RCB ...) tag.
                 new_nick = member.nick
 
-            ok = await route_and_rename(member, race_vc, new_nick, rig_tag)
+            ok = await route_and_rename(member, race_vc, new_nick, rig_tag, group_id)
             if ok:
                 active_groups[group_id]["managed_member_ids"].add(member.id)
             await asyncio.sleep(0.6)
@@ -362,6 +391,26 @@ async def cleanup_race_vc(group_id):
                 f"[Safety Shield] Channel {race_vc.name} still has {len(managed_still_present)} "
                 f"managed member(s). Aborting deletion to prevent stranding."
             )
+
+async def state_heartbeat():
+    """Periodic one-line summary of internal state so a long log file is
+    scannable at a glance — you can grep '[Heartbeat]' to get a timeline
+    of how many sessions the bot thought were active over the day."""
+    await bot.wait_until_ready()
+    while True:
+        try:
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            return
+        try:
+            print(
+                f"[Heartbeat] active={len(active_groups)} "
+                f"pending={len(pending_groups)} "
+                f"setup={len(setup_tasks)} "
+                f"cleanup={len(cleanup_tasks)}"
+            )
+        except Exception as e:
+            print(f"[Heartbeat] failed to emit: {e}")
 
 async def monitor_log_files():
     await bot.wait_until_ready()
@@ -629,6 +678,7 @@ async def on_ready():
 
     print(f"------------------")
     bot.loop.create_task(monitor_log_files())
+    bot.loop.create_task(state_heartbeat())
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
