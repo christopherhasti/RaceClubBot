@@ -108,6 +108,7 @@ LOG_DIRECTORY = os.environ.get("LOG_DIRECTORY") or os.path.join(
 )
 
 HARDWARE_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hardware_map.json")
+STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 hardware_map = {
     "e5jgr10z2sx": "RCB_1",
@@ -137,6 +138,25 @@ def save_hardware_map():
             json.dump(hardware_map, f, indent=2)
     except Exception as e:
         print(f"[Hardware Map] Failed to persist map: {e}")
+
+def save_state():
+    """Persist active_groups so a restart in the middle of a session can
+    resume tracking the existing channels instead of treating them as
+    orphans. Called after every mutation of active_groups."""
+    try:
+        serializable = {
+            gid: {
+                "channel_id": d.get("channel_id"),
+                "setup_complete": d.get("setup_complete", False),
+                "managed_member_ids": list(d.get("managed_member_ids", set())),
+                "roster": d.get("roster", {}),
+            }
+            for gid, d in active_groups.items()
+        }
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"active_groups": serializable}, f, indent=2)
+    except Exception as e:
+        print(f"[State] Failed to persist: {e}")
 
 pending_groups = {}
 recent_vm_names = {}
@@ -168,33 +188,75 @@ def get_active_log_path():
         return None
     return max(candidates, key=os.path.getmtime)
 
+# Cache of rig_tag.lower() -> member.id. Populated lazily by find_rig_member()
+# on first lookup, invalidated when a member updates their name/nick (see the
+# on_member_update / on_member_remove handlers further down). Turns a per-rig
+# O(N) scan over guild.members into O(1) for repeat lookups during a session.
+_rig_member_cache = {}
+
+def _member_matches_rig(member, target_lower):
+    base_username = member.name.lower()
+    global_name = (member.global_name or "").lower()
+    server_nick = (member.nick or "").lower()
+    effective_display = member.display_name.lower()
+    return target_lower in (base_username, global_name, server_nick, effective_display)
+
 def find_rig_member(guild, rig_name):
     target = rig_name.lower()
-    for member in guild.members:
-        base_username = member.name.lower()
-        global_name = (member.global_name or "").lower()
-        server_nick = (member.nick or "").lower()
-        effective_display = member.display_name.lower()
+    cached_id = _rig_member_cache.get(target)
+    if cached_id is not None:
+        m = guild.get_member(cached_id)
+        if m and _member_matches_rig(m, target):
+            return m
+        _rig_member_cache.pop(target, None)  # stale, fall through to scan
 
-        if target in (base_username, global_name, server_nick, effective_display):
+    for member in guild.members:
+        if _member_matches_rig(member, target):
+            _rig_member_cache[target] = member.id
             return member
     return None
 
+def _invalidate_member_cache(member_id):
+    stale_keys = [k for k, v in _rig_member_cache.items() if v == member_id]
+    for k in stale_keys:
+        _rig_member_cache.pop(k, None)
+
 def compute_nick(rig_tag, target_name):
-    """Compute the desired nickname for a driver. Returns None to clear nick."""
+    """Compute the desired nickname for a driver. Returns None to clear nick.
+    Logs when Discord's 32-character nickname limit forces truncation so you
+    can spot drivers whose names keep showing up cut off."""
     if not target_name or target_name.lower() == rig_tag.lower():
         return None
     if re.match(r"^\d+\s*RCB$", target_name, re.IGNORECASE):
         return None
     rig_display = rig_tag.replace("_", " ")
-    return f"({rig_display}) {target_name}"[:32]
+    full = f"({rig_display}) {target_name}"
+    if len(full) > 32:
+        truncated = full[:32]
+        print(f"[Nick Truncated] '{full}' → '{truncated}' (Discord 32-char limit)")
+        return truncated
+    return full
+
+def is_placeholder_name(name):
+    """A name is a 'placeholder' if it's the default rig identity rather than a
+    real driver name. Used by the refresh path to only promote placeholder→real
+    transitions, never swap one real name for another (which is the bug that
+    caused the Brandon/Ryan flapping when two sessions ran concurrently — VM
+    blocks don't carry a group_id so cross-session contamination is possible)."""
+    if not name:
+        return True
+    if re.match(r"^\d+\s*RCB$", name, re.IGNORECASE):  # "1 RCB", "11 RCB"
+        return True
+    if re.match(r"^RCB_\d+$", name, re.IGNORECASE):    # "RCB_1", "RCB_11"
+        return True
+    return False
 
 async def execute_delayed_setup(group_id):
     await asyncio.sleep(0.5)
     staged_data = pending_groups.pop(group_id, {})
     setup_tasks.pop(group_id, None)
 
-    if staged_data and not any(k.lower() == group_id.lower() for k in active_groups):
+    if staged_data and group_id not in active_groups:
         print(f"\n[Grid Action] Roster locked! Establishing private voice infrastructure for session: {group_id}")
         await setup_race_vc(group_id, staged_data)
 
@@ -253,6 +315,13 @@ async def setup_race_vc(group_id, staged_roster):
         "managed_member_ids": set(),
         "roster": dict(staged_roster),
     }
+    save_state()
+
+    # BUG-2: Track any bot-managed channels we rescue drivers from, so we can
+    # tear them down at the end of setup. Handles back-to-back sessions where
+    # the old channel is still in its 45s grace period, and post-crash recovery
+    # where the LoungeControl server died without emitting `removed`.
+    handoff_sources = set()
 
     try:
         for rig_tag, target_name in staged_roster.items():
@@ -260,9 +329,28 @@ async def setup_race_vc(group_id, staged_roster):
             if not (member and member.voice and member.voice.channel):
                 continue
 
-            if member.voice.channel.id not in [WAITING_ROOM_VC_ID, race_vc.id]:
-                print(f" -> [{group_id}] Skipped {rig_tag}: Currently occupied in {member.voice.channel.name}, not in Waiting Room.")
-                continue
+            current_ch = member.voice.channel
+            if current_ch.id not in [WAITING_ROOM_VC_ID, race_vc.id]:
+                # Is the driver stuck in another channel the bot still tracks?
+                # If yes, this is a hand-off (back-to-back sessions or crash
+                # recovery) — rescue them. If no, it's an admin escape hatch
+                # (e.g. Boise Coms N) — leave them alone.
+                owning_group_id = next(
+                    (gid for gid, d in active_groups.items()
+                     if d.get("channel_id") == current_ch.id and gid != group_id),
+                    None
+                )
+                if owning_group_id:
+                    # active_groups still has it, so cleanup hasn't started
+                    # popping yet. Cancel any pending grace-period sleep first.
+                    old_task = cleanup_tasks.pop(owning_group_id, None)
+                    if old_task and not old_task.done():
+                        old_task.cancel()
+                    print(f" -> [{group_id}] Rescuing {rig_tag} from prior bot session {owning_group_id}.")
+                    handoff_sources.add(owning_group_id)
+                else:
+                    print(f" -> [{group_id}] Skipped {rig_tag}: Currently occupied in {current_ch.name}, not in Waiting Room.")
+                    continue
 
             new_nick = compute_nick(rig_tag, target_name)
             if new_nick is None and member.nick and not member.nick.startswith("(RCB"):
@@ -272,6 +360,7 @@ async def setup_race_vc(group_id, staged_roster):
             ok = await route_and_rename(member, race_vc, new_nick, rig_tag, group_id)
             if ok:
                 active_groups[group_id]["managed_member_ids"].add(member.id)
+                save_state()
             await asyncio.sleep(0.6)
 
         # --- GHOST LOBBY SWEEPER ---
@@ -279,6 +368,7 @@ async def setup_race_vc(group_id, staged_roster):
         if len(race_vc.members) == 0:
             print(f"[Cleanup Engine] No valid drivers routed. Sweeping empty ghost lobby: {vc_name}")
             active_groups.pop(group_id, None)
+            save_state()
             try:
                 await race_vc.delete()
             except Exception:
@@ -288,6 +378,12 @@ async def setup_race_vc(group_id, staged_roster):
     finally:
         if group_id in active_groups:
             active_groups[group_id]["setup_complete"] = True
+            save_state()
+        # Tear down any old bot-managed sessions we pulled drivers from. Safe
+        # to call even if on_voice_state_update auto-cleanup already fired —
+        # cleanup_race_vc no-ops when active_groups has already been popped.
+        for old_gid in handoff_sources:
+            bot.loop.create_task(cleanup_race_vc(old_gid))
 
 async def refresh_active_group_nicknames(roster_updates):
     """When the VM block resolves new driver names, re-apply nicks for any
@@ -313,6 +409,16 @@ async def refresh_active_group_nicknames(roster_updates):
                 continue
             old_name = roster.get(rig_tag)
             if old_name == driver_name:
+                continue
+
+            # BUG-1 GUARD: only PROMOTE placeholder→real names, never SWAP one
+            # real name for another. Cross-session VM-block contamination can
+            # propose bogus name changes ("Brandon Morris → Ryan Dunlap") when
+            # two sessions are forming concurrently; refusing swaps between two
+            # real names eliminates the flapping.
+            if not is_placeholder_name(old_name):
+                continue
+            if is_placeholder_name(driver_name):
                 continue
 
             member = find_rig_member(guild, rig_tag)
@@ -346,6 +452,7 @@ async def cleanup_race_vc(group_id):
     group_data = active_groups.pop(group_id, None)
     if not group_data:
         return
+    save_state()
 
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
@@ -392,10 +499,65 @@ async def cleanup_race_vc(group_id):
                 f"managed member(s). Aborting deletion to prevent stranding."
             )
 
+async def reconcile_persisted_state(guild):
+    """On bot startup, restore active_groups from disk and verify each
+    session against Discord reality (channel exists? managed members still
+    in it?). Sessions whose channel is gone or whose drivers have all left
+    get dropped — channels with surviving drivers resume tracking, so
+    cleanup/finish/removed events still work for them after a restart."""
+    if not os.path.exists(STATE_PATH):
+        return
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f).get("active_groups", {})
+    except Exception as e:
+        print(f"[State Restore] Failed to read {STATE_PATH}: {e}")
+        return
+
+    if not saved:
+        return
+
+    restored, dropped = 0, 0
+    for gid, d in saved.items():
+        channel_id = d.get("channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            dropped += 1
+            continue
+
+        saved_managed_ids = set(d.get("managed_member_ids", []))
+        current_ids = {m.id for m in channel.members}
+        still_present = saved_managed_ids & current_ids
+
+        if not still_present:
+            # No survivors — try to delete the empty channel. If admins are in
+            # it, the on_voice_state_update sweep will handle it later.
+            if len(channel.members) == 0:
+                try:
+                    await channel.delete()
+                    print(f"[State Restore] Channel for session {gid} had no surviving drivers — deleted.")
+                except Exception:
+                    pass
+            dropped += 1
+            continue
+
+        active_groups[gid] = {
+            "channel_id": channel_id,
+            "setup_complete": True,
+            "managed_member_ids": still_present,
+            "roster": d.get("roster", {}),
+        }
+        restored += 1
+
+    save_state()
+    print(f"[State Restore] Restored {restored} session(s), dropped {dropped} (channel missing or empty).")
+
 async def state_heartbeat():
     """Periodic one-line summary of internal state so a long log file is
     scannable at a glance — you can grep '[Heartbeat]' to get a timeline
-    of how many sessions the bot thought were active over the day."""
+    of how many sessions the bot thought were active over the day. Now
+    includes per-session driver counts so you can reconstruct what was
+    happening when something went wrong without grepping for Routed/Skipped."""
     await bot.wait_until_ready()
     while True:
         try:
@@ -403,8 +565,15 @@ async def state_heartbeat():
         except asyncio.CancelledError:
             return
         try:
+            if active_groups:
+                active_brief = ", ".join(
+                    f"{gid}={len(d.get('managed_member_ids', set()))}drv"
+                    for gid, d in active_groups.items()
+                )
+            else:
+                active_brief = "none"
             print(
-                f"[Heartbeat] active={len(active_groups)} "
+                f"[Heartbeat] active=[{active_brief}] "
                 f"pending={len(pending_groups)} "
                 f"setup={len(setup_tasks)} "
                 f"cleanup={len(cleanup_tasks)}"
@@ -452,6 +621,29 @@ async def monitor_log_files():
                     continue
 
                 line_lower = line.lower()
+
+                # BUG-3: LoungeControl server restart. After a crash there's no
+                # `removed` or `to Finished` event for the dead sessions, so
+                # active_groups would otherwise leak forever and the drivers'
+                # voice channels would block the next session. When we see
+                # "[INF] Starting server", every previously-tracked session is
+                # by definition dead — tear them all down.
+                if re.search(r"\[INF\]\s+Starting server\b", line):
+                    if active_groups:
+                        orphan_ids = list(active_groups.keys())
+                        print(f"[Server Restart Detected] LoungeControl restart — cleaning up {len(orphan_ids)} orphaned session(s): {', '.join(orphan_ids)}")
+                        # Reset all per-group VM-correlation state too; the
+                        # forming-group context belongs to the dead server.
+                        current_slot_to_hw.clear()
+                        current_group_roster.clear()
+                        active_car_applies.clear()
+                        last_vm_state.clear()
+                        for old_gid in orphan_ids:
+                            old_task = cleanup_tasks.pop(old_gid, None)
+                            if old_task and not old_task.done():
+                                old_task.cancel()
+                            bot.loop.create_task(cleanup_race_vc(old_gid))
+                    continue
 
                 conn_match = re.search(r"Launcher\s+(RCB[\w\s]+)\s+\(([a-z0-9]+)\)\s+connected", line, re.IGNORECASE)
                 if conn_match:
@@ -554,7 +746,7 @@ async def monitor_log_files():
                         pending_groups[group_id][rig_account] = driver_name
                         print(f"[Grid Staged - PRIMARY] Mapped {rig_account} ({hw_code}) as '{driver_name}' to session {group_id}.")
 
-                        if group_id not in setup_tasks and not any(k.lower() == group_id.lower() for k in active_groups):
+                        if group_id not in setup_tasks and group_id not in active_groups:
                             setup_tasks[group_id] = bot.loop.create_task(execute_delayed_setup(group_id))
                     continue
 
@@ -562,7 +754,7 @@ async def monitor_log_files():
                 if start_match:
                     group_id = start_match.group(1)
 
-                    if current_group_roster and not any(k.lower() == group_id.lower() for k in active_groups) and group_id not in setup_tasks:
+                    if current_group_roster and group_id not in active_groups and group_id not in setup_tasks:
                         print(f"[Grid Staged - BACKUP] Ready Check bypassed. Using live car telemetry for session {group_id}.")
                         pending_groups[group_id] = {}
 
@@ -579,16 +771,15 @@ async def monitor_log_files():
                 finish_match = re.search(r"changing group state from \w+ to Finished, group:\s*([A-Za-z0-9_\-]+)", line, re.IGNORECASE)
                 if finish_match:
                     extracted_id = finish_match.group(1)
-                    target_key = next((k for k in active_groups if k.lower() == extracted_id.lower()), None)
-                    if target_key:
-                        await schedule_cleanup(target_key, delay=POST_RACE_GRACE_SECONDS)
+                    if extracted_id in active_groups:
+                        await schedule_cleanup(extracted_id, delay=POST_RACE_GRACE_SECONDS)
                     continue
 
                 if "removed" in line_lower:
                     teardown_match = re.search(r"group\s+([A-Za-z0-9_\-]+)\s+removed", line, re.IGNORECASE)
                     if teardown_match:
                         extracted_id = teardown_match.group(1)
-                        target_key = next((k for k in active_groups if k.lower() == extracted_id.lower()), None)
+                        target_key = extracted_id if extracted_id in active_groups else None
 
                         if target_key:
                             if target_key in cleanup_tasks:
@@ -614,6 +805,18 @@ async def monitor_log_files():
                     file_handle.close()
                 except Exception:
                     pass
+
+@bot.event
+async def on_member_update(before, after):
+    # If the bot itself changed the nickname (the common case during routing),
+    # we still want to invalidate because the cache might have stale entries
+    # under another rig_tag. Cheap to invalidate, expensive to be wrong.
+    if before.name != after.name or before.nick != after.nick or before.global_name != after.global_name:
+        _invalidate_member_cache(after.id)
+
+@bot.event
+async def on_member_remove(member):
+    _invalidate_member_cache(member.id)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -646,9 +849,13 @@ async def on_voice_state_update(member, before, after):
                     return
 
                 try:
+                    popped_any = False
                     for group_id, data in list(active_groups.items()):
                         if data["channel_id"] == vc.id:
                             active_groups.pop(group_id, None)
+                            popped_any = True
+                    if popped_any:
+                        save_state()
 
                     await vc.delete()
                     print(f"[Cleanup Engine] Auto-cleaned empty orphaned channel: {vc.name}")
@@ -666,9 +873,17 @@ async def on_ready():
     if guild is None:
         print(f"CRITICAL WARNING: Guild ID {GUILD_ID} not found. Check your .env file.")
         return
+
+    # Restore in-progress sessions from disk BEFORE the orphan sweep so we
+    # don't delete a channel we were tracking but lost in-memory.
+    await reconcile_persisted_state(guild)
+
     category = guild.get_channel(RACE_CATEGORY_ID)
     if category:
+        tracked_channel_ids = {d["channel_id"] for d in active_groups.values()}
         for vc in category.voice_channels:
+            if vc.id in tracked_channel_ids:
+                continue  # restored session — leave alone
             if vc.name.startswith("🏁 Server-") and len(vc.members) == 0:
                 try:
                     await vc.delete()
